@@ -24,7 +24,20 @@ type Queue struct {
 	// DB pending 任务的恢复是周期性的,而任务状态只有被 worker 取走才会变更;
 	// 不去重会把同一任务重复入队,迅速灌满缓冲 channel 并挤占新任务提交。
 	enqueued sync.Map
+	// executing 正在本进程内执行的任务ID。
+	// 任务被 worker 取走后、UpdateStatus 落库为 running 之前(以及落库失败时),
+	// DB 里仍是 pending;恢复循环每 5s 扫一次,会把这行再投给另一个 worker,
+	// 于是同一 task_id 并发执行两次(实盘见 2026-11-18 磁盘指标任务)。
+	executing sync.Map
 }
+
+// 任务认领(把状态改为 running)的重试参数。
+// 落库失败时若继续执行,DB 里仍为 pending,恢复循环必然重复投递,
+// 因此这里重试有限次后放弃本轮,让任务保持 pending 等下一轮恢复。
+const (
+	claimMaxAttempts = 3
+	claimBackoff     = 200 * time.Millisecond
+)
 
 // Config 任务队列配置
 type Config struct {
@@ -151,8 +164,9 @@ func (q *Queue) enqueuePendingBatch(ctx context.Context) {
 	recovered := 0
 	for i := range pendingTasks {
 		task := pendingTasks[i]
-		// 已在 channel 中等待的任务不再重复入队
-		if q.isEnqueued(task.ID) {
+		// 已在 channel 中等待,或已在本进程执行(状态尚未落库为 running)的任务
+		// 不再重复入队,否则同一任务会被两个 worker 并发执行
+		if q.isEnqueued(task.ID) || q.isExecuting(task.ID) {
 			continue
 		}
 
@@ -195,6 +209,43 @@ func (q *Queue) unmarkEnqueued(id string) {
 func (q *Queue) isEnqueued(id string) bool {
 	_, ok := q.enqueued.Load(id)
 	return ok
+}
+
+// markExecuting 标记任务正在本进程执行
+func (q *Queue) markExecuting(id string) {
+	q.executing.Store(id, struct{}{})
+}
+
+// unmarkExecuting 解除执行标记
+func (q *Queue) unmarkExecuting(id string) {
+	q.executing.Delete(id)
+}
+
+// isExecuting 查询任务是否正在本进程执行
+func (q *Queue) isExecuting(id string) bool {
+	_, ok := q.executing.Load(id)
+	return ok
+}
+
+// claimTask 把任务状态原子地推进到 running(带有限重试)。
+// 返回错误表示本轮认领失败,调用方必须放弃执行:此时 DB 里仍是 pending,
+// 若继续跑,5s 后的恢复循环会把同一任务再投一次,造成并发重复执行。
+func (q *Queue) claimTask(taskID string) error {
+	var err error
+	for attempt := 1; attempt <= claimMaxAttempts; attempt++ {
+		err = q.repo.UpdateStatus(context.Background(), taskID, TaskStatusRunning, "任务开始执行")
+		if err == nil {
+			return nil
+		}
+		q.logger.Warn("任务认领失败,准备重试",
+			elog.String("task_id", taskID),
+			elog.Int("attempt", attempt),
+			elog.FieldErr(err))
+		if attempt < claimMaxAttempts {
+			time.Sleep(time.Duration(attempt) * claimBackoff)
+		}
+	}
+	return err
 }
 
 // pendingTaskRecoverLoop 持续从数据库恢复 pending 任务
@@ -285,20 +336,32 @@ func (q *Queue) worker(id int) {
 
 // executeTask 执行任务
 func (q *Queue) executeTask(workerID int, task *Task) {
+	// 同一任务可能被重复投递(见 executing 字段注释):本进程已在跑就直接丢弃
+	if q.isExecuting(task.ID) {
+		q.logger.Warn("任务已在执行中,丢弃重复投递",
+			elog.Int("worker_id", workerID),
+			elog.String("task_id", task.ID))
+		return
+	}
+	q.markExecuting(task.ID)
+	defer q.unmarkExecuting(task.ID)
+
 	q.logger.Info("开始执行任务",
 		elog.Int("worker_id", workerID),
 		elog.String("task_id", task.ID),
 		elog.String("task_type", string(task.Type)))
 
-	// 任务已离开 channel,允许恢复流程在其重新落库 pending 时再次入队
-	q.unmarkEnqueued(task.ID)
-
-	// 更新任务状态为运行中
-	if err := q.repo.UpdateStatus(context.Background(), task.ID, TaskStatusRunning, "任务开始执行"); err != nil {
-		q.logger.Error("更新任务状态失败",
+	// 先认领成功再执行:落库失败时若仍继续跑,DB 里是 pending,
+	// 恢复循环会重复投递同一任务,导致并发执行
+	if err := q.claimTask(task.ID); err != nil {
+		q.logger.Error("任务状态置为运行中失败,本轮放弃执行,等待下一轮恢复",
 			elog.String("task_id", task.ID),
 			elog.FieldErr(err))
+		return
 	}
+
+	// 任务已落库为 running,允许恢复流程在其重新落库 pending 时(如失败重试)再次入队
+	q.unmarkEnqueued(task.ID)
 
 	// 获取执行器
 	q.mu.RLock()
