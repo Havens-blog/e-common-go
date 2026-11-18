@@ -289,20 +289,26 @@ func (q *Queue) Submit(task *Task) error {
 		task.CreatedAt = time.Now()
 	}
 
+	// 投递之后不得再读 task：worker 取走任务后立刻改写 Status/Error/Result，
+	// 与落库时读 *task 构成数据竞争（CI `go test -race` 已在 cert 模块抓到）。
+	// 先取快照与要用的字段，之后的日志与落库一律用快照。
+	snapshot := cloneTaskSnapshot(task)
+	taskID, taskType := task.ID, task.Type
+
 	// 先尝试入队列，避免队列满时仍写入DB产生垃圾数据
 	select {
 	case q.taskChan <- task:
 		// 入队成功，再持久化到数据库
-		if err := q.repo.Create(context.Background(), *task); err != nil {
+		if err := q.repo.Create(context.Background(), snapshot); err != nil {
 			q.logger.Error("保存任务到数据库失败（任务已入队列）",
-				elog.String("task_id", task.ID),
+				elog.String("task_id", taskID),
 				elog.FieldErr(err))
 		}
-		q.markEnqueued(task.ID)
+		q.markEnqueued(taskID)
 
 		q.logger.Info("提交任务",
-			elog.String("task_id", task.ID),
-			elog.String("task_type", string(task.Type)))
+			elog.String("task_id", taskID),
+			elog.String("task_type", string(taskType)))
 		return nil
 	case <-q.ctx.Done():
 		return fmt.Errorf("任务队列已关闭")
@@ -496,4 +502,24 @@ func (q *Queue) CancelTask(taskID string) error {
 
 	// 更新任务状态为已取消
 	return q.repo.UpdateStatus(context.Background(), taskID, TaskStatusCancelled, "任务已取消")
+}
+
+// cloneTaskSnapshot 在任务交给 worker 之前做一份快照。
+// 任务入队后由 worker（及其执行器）独占改写，投递方再读同一对象就是数据竞争，
+// 落库内容也可能被中途改写（例如把还没执行完的任务存成 completed）。
+func cloneTaskSnapshot(task *Task) Task {
+	snapshot := *task
+	if task.Params != nil {
+		snapshot.Params = make(map[string]interface{}, len(task.Params))
+		for k, v := range task.Params {
+			snapshot.Params[k] = v
+		}
+	}
+	if task.Result != nil {
+		snapshot.Result = make(map[string]interface{}, len(task.Result))
+		for k, v := range task.Result {
+			snapshot.Result[k] = v
+		}
+	}
+	return snapshot
 }

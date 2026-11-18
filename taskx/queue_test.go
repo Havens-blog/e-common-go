@@ -297,3 +297,80 @@ func TestExecuteTaskDropsDuplicateWhileExecuting(t *testing.T) {
 		t.Fatalf("重复投递的副本不得执行,实测执行 %d 次", got)
 	}
 }
+
+// blockingCreateRepo 让 Create 停在「已投递、正在落库」这一刻：
+// 此时 worker 已经拿到同一个 *Task 并在执行，两边只要都碰这个对象就是竞争。
+type blockingCreateRepo struct {
+	*fakeRepo
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	gotMu   sync.Mutex
+	got     Task
+}
+
+func (b *blockingCreateRepo) Create(ctx context.Context, task Task) error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	b.gotMu.Lock()
+	b.got = task
+	b.gotMu.Unlock()
+	return b.fakeRepo.Create(ctx, task)
+}
+
+func (b *blockingCreateRepo) stored() Task {
+	b.gotMu.Lock()
+	defer b.gotMu.Unlock()
+	return b.got
+}
+
+// signalingExecutor 在执行器入口通知测试，并像真实执行器那样往任务上写结果。
+type signalingExecutor struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *signalingExecutor) Execute(_ context.Context, task *Task) error {
+	s.once.Do(func() { close(s.started) })
+	task.Result = map[string]interface{}{"done": true}
+	return nil
+}
+
+func (s *signalingExecutor) GetType() TaskType { return "test" }
+
+// 回归：任务交给队列之后，Submit 不得再读同一个 Task 对象。
+// 历史缺陷：入队后仍用 *task 落库（queue.go 的 repo.Create(..., *task)），
+// 与 worker 里的 task.Status = completed 构成数据竞争；
+// 调用方（e-cam-service internal/cert/service）的集成测试在 CI -race 下抓到。
+// 本用例只有在 -race 下才能真正判负：无竞争时它只校验落库内容取自投递瞬间的快照。
+func TestSubmitDoesNotReadTaskAfterEnqueue(t *testing.T) {
+	repo := &blockingCreateRepo{
+		fakeRepo: newFakeRepo(newTestTask("t1", TaskStatusPending)),
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	exec := &signalingExecutor{started: make(chan struct{})}
+	q := NewQueue(repo, elog.DefaultLogger, Config{WorkerNum: 1, BufferSize: 10})
+	q.RegisterExecutor(exec)
+	q.Start()
+	defer q.Stop()
+
+	task := newTestTask("t1", TaskStatusPending)
+	done := make(chan error, 1)
+	go func() { done <- q.Submit(&task) }()
+
+	<-repo.entered // 已投递成功，正在落库
+	<-exec.started // worker 已取走同一个任务并开始执行
+	// 等 worker 把状态写回任务对象（executeTask 在 Execute 返回后写 completed），
+	// 再放行落库：修复前 Submit 在这之后才读 *task，正好与这次写入冲突。
+	time.Sleep(100 * time.Millisecond)
+	close(repo.release)
+	if err := <-done; err != nil {
+		t.Fatalf("Submit 失败: %v", err)
+	}
+
+	// 落库的必须是提交那一刻的快照；若读到 worker 改写后的对象，状态就会漂移。
+	if got := repo.stored(); got.Status != TaskStatusPending {
+		t.Fatalf("落库状态被 worker 中途改写为 %q, want %q", got.Status, TaskStatusPending)
+	}
+}
