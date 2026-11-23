@@ -2,6 +2,7 @@ package taskx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -227,25 +228,37 @@ func (q *Queue) isExecuting(id string) bool {
 	return ok
 }
 
-// claimTask 把任务状态原子地推进到 running(带有限重试)。
-// 返回错误表示本轮认领失败,调用方必须放弃执行:此时 DB 里仍是 pending,
-// 若继续跑,5s 后的恢复循环会把同一任务再投一次,造成并发重复执行。
-func (q *Queue) claimTask(taskID string) error {
-	var err error
+// claimTask 原子认领任务(pending → running),返回是否认领到。
+//
+// 三态语义:
+//   - (true, nil)  认领成功,调用方可执行;
+//   - (false, nil) 已被其他副本或 worker 认领(或状态已非 pending),静默退场,
+//     不得重试——重试只会得到同样的 false;
+//   - (false, err) 落库失败,重试 claimMaxAttempts 次后放弃本轮。
+//
+// 为什么必须条件更新:UpdateStatus 对 _id 是盲写,两个副本都会「认领成功」并
+// 同时执行同一 task_id;进程内的 executing 标记只在单进程内有效。
+func (q *Queue) claimTask(taskID string) (bool, error) {
+	var lastErr error
+
 	for attempt := 1; attempt <= claimMaxAttempts; attempt++ {
-		err = q.repo.UpdateStatus(context.Background(), taskID, TaskStatusRunning, "任务开始执行")
+		claimed, err := q.repo.ClaimRunning(context.Background(), taskID)
 		if err == nil {
-			return nil
+			return claimed, nil
 		}
+
+		lastErr = err
 		q.logger.Warn("任务认领失败,准备重试",
 			elog.String("task_id", taskID),
 			elog.Int("attempt", attempt),
 			elog.FieldErr(err))
+
 		if attempt < claimMaxAttempts {
 			time.Sleep(time.Duration(attempt) * claimBackoff)
 		}
 	}
-	return err
+
+	return false, lastErr
 }
 
 // pendingTaskRecoverLoop 持续从数据库恢复 pending 任务
@@ -359,10 +372,19 @@ func (q *Queue) executeTask(workerID int, task *Task) {
 
 	// 先认领成功再执行:落库失败时若仍继续跑,DB 里是 pending,
 	// 恢复循环会重复投递同一任务,导致并发执行
-	if err := q.claimTask(task.ID); err != nil {
+	claimed, claimErr := q.claimTask(task.ID)
+	if claimErr != nil {
 		q.logger.Error("任务状态置为运行中失败,本轮放弃执行,等待下一轮恢复",
 			elog.String("task_id", task.ID),
-			elog.FieldErr(err))
+			elog.FieldErr(claimErr))
+		return
+	}
+	if !claimed {
+		// 另一副本(或同副本的另一 worker)已认领:此时它在真正执行,
+		// 本副本必须退场,否则同一 task_id 被并发执行两次。
+		q.logger.Info("任务已被其他实例认领,丢弃重复投递",
+			elog.Int("worker_id", workerID),
+			elog.String("task_id", task.ID))
 		return
 	}
 
@@ -383,9 +405,39 @@ func (q *Queue) executeTask(workerID int, task *Task) {
 		return
 	}
 
-	// 执行任务
-	ctx := context.Background()
-	err := executor.Execute(ctx, task)
+	// 执行任务:带预算的 ctx。执行器声明了 TaskTimeoutProvider 就用它,
+	// 否则回落 DefaultTaskTimeout。
+	//
+	// 超时语义是「本 worker 不再等待」而不是「强杀执行器」:Go 的 context 是
+	// 协作式的,只能由执行器主动检查 ctx.Done() 退出。为避免一个卡死的执行器
+	// 永久占用 worker(worker 数固定,挂几个任务面就停摆),这里用 goroutine +
+	// select 放弃等待;执行器若完全忽略 ctx,它仍会跑完,但不再占 worker 容量。
+	//
+	// 落库(`dbCtx`)刻意不复用 execCtx:执行预算耗尽时 execCtx 立即过期,
+	// 用它写状态会让「超时」这一事实本身写不进 DB。
+	taskID := task.ID
+	dbCtx := context.Background()
+	timeout := taskTimeoutOf(executor)
+	execCtx, cancel := context.WithTimeout(dbCtx, timeout)
+	defer cancel()
+
+	err := q.runExecutor(execCtx, executor, task)
+
+	// 超时终止:直接落 failed 且不进重试。重试只会再撞同一个预算,
+	// 把一次超时放大成 N 次无效执行,还白白占掉 worker。
+	if errors.Is(err, context.DeadlineExceeded) && execCtx.Err() != nil {
+		msg := fmt.Sprintf("任务超时终止(超过 %s)", timeout)
+		q.logger.Error("任务执行超时,已终止",
+			elog.String("task_id", taskID),
+			elog.Duration("timeout", timeout))
+
+		if updateErr := q.repo.UpdateStatus(dbCtx, taskID, TaskStatusFailed, msg); updateErr != nil {
+			q.logger.Error("超时后更新任务状态失败",
+				elog.String("task_id", taskID),
+				elog.FieldErr(updateErr))
+		}
+		return
+	}
 
 	if err != nil {
 		q.logger.Error("任务执行失败",
@@ -405,7 +457,7 @@ func (q *Queue) executeTask(workerID int, task *Task) {
 			task.Status = TaskStatusPending
 			task.Error = err.Error()
 
-			if updateErr := q.repo.Update(ctx, *task); updateErr != nil {
+			if updateErr := q.repo.Update(dbCtx, *task); updateErr != nil {
 				q.logger.Error("更新任务重试计数失败",
 					elog.String("task_id", task.ID),
 					elog.FieldErr(updateErr))
@@ -435,7 +487,7 @@ func (q *Queue) executeTask(workerID int, task *Task) {
 
 			task.Status = TaskStatusFailed
 			task.Error = fmt.Sprintf("重试%d次后仍失败: %s", task.RetryCount, err.Error())
-			q.repo.UpdateStatus(ctx, task.ID, TaskStatusFailed, task.Error)
+			q.repo.UpdateStatus(dbCtx, taskID, TaskStatusFailed, task.Error)
 		}
 	} else {
 		q.logger.Info("任务执行成功",
@@ -443,11 +495,11 @@ func (q *Queue) executeTask(workerID int, task *Task) {
 
 		// 更新任务状态为完成
 		task.Status = TaskStatusCompleted
-		q.repo.UpdateStatus(ctx, task.ID, TaskStatusCompleted, "任务执行完成")
+		q.repo.UpdateStatus(dbCtx, taskID, TaskStatusCompleted, "任务执行完成")
 	}
 
 	// 更新任务结果
-	if err := q.repo.Update(ctx, *task); err != nil {
+	if err := q.repo.Update(dbCtx, *task); err != nil {
 		q.logger.Error("更新任务结果失败",
 			elog.String("task_id", task.ID),
 			elog.FieldErr(err))
@@ -502,6 +554,35 @@ func (q *Queue) CancelTask(taskID string) error {
 
 	// 更新任务状态为已取消
 	return q.repo.UpdateStatus(context.Background(), taskID, TaskStatusCancelled, "任务已取消")
+}
+
+// taskTimeoutOf 取执行器的任务预算;未实现 TaskTimeoutProvider 或返回
+// 非正值时回落 DefaultTaskTimeout。
+func taskTimeoutOf(executor TaskExecutor) time.Duration {
+	if p, ok := executor.(TaskTimeoutProvider); ok {
+		if d := p.Timeout(); d > 0 {
+			return d
+		}
+	}
+
+	return DefaultTaskTimeout
+}
+
+// runExecutor 在独立 goroutine 里执行任务,ctx 到期后放弃等待。
+//
+// done 必须带缓冲(容量 1):放弃等待后执行器仍可能返回,无缓冲 channel 上
+// 的 send 会永久阻塞,泄漏一个 goroutine——超时本就是为了不泄漏资源。
+func (q *Queue) runExecutor(ctx context.Context, executor TaskExecutor, task *Task) error {
+	done := make(chan error, 1)
+
+	go func() { done <- executor.Execute(ctx, task) }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // cloneTaskSnapshot 在任务交给 worker 之前做一份快照。

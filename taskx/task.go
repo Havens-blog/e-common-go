@@ -40,6 +40,13 @@ type Task struct {
 	MaxRetries  int                    `json:"max_retries,omitempty" bson:"max_retries"`   // 最大重试次数（默认3）
 }
 
+// DefaultTaskTimeout 执行器未声明 TaskTimeoutProvider 时的任务预算。
+//
+// 队列必须有预算:worker 数量固定(默认 5),一个卡在厂商 API 长尾上的执行器
+// 会永久吃掉 1/5 吞吐,五个挂住任务面即停摆,而日志里只有「开始执行」没有
+// 「失败」——监控上一切正常,是最难排查的故障形态。
+const DefaultTaskTimeout = 30 * time.Minute
+
 // TaskExecutor 任务执行器接口
 type TaskExecutor interface {
 	// Execute 执行任务
@@ -47,6 +54,14 @@ type TaskExecutor interface {
 
 	// GetType 获取任务类型
 	GetType() TaskType
+}
+
+// TaskTimeoutProvider 可选接口:执行器按任务类型声明自己的执行预算。
+//
+// 队列用类型断言探测(未实现则回落 DefaultTaskTimeout),因此给 TaskExecutor
+// 直接加方法会破坏所有既有实现,这里保持可选。返回 <=0 视为未声明。
+type TaskTimeoutProvider interface {
+	Timeout() time.Duration
 }
 
 // TaskRepository 任务仓储接口
@@ -62,6 +77,15 @@ type TaskRepository interface {
 
 	// UpdateStatus 更新任务状态
 	UpdateStatus(ctx context.Context, id string, status TaskStatus, message string) error
+
+	// ClaimRunning 原子认领任务:仅当任务仍为 pending 时推进到 running,
+	// 返回是否认领成功。
+	//
+	// 实现必须是条件更新(filter 同时匹配 _id 与 status=pending),不能是
+	// 只按 _id 的盲写:盲写时两个副本都会认领成功,同一 task_id 被并发执行
+	// 两次;Queue 进程内的 executing 标记只能挡住单副本内的重复投递。
+	// 返回 (false, nil) 表示已被他人认领或状态已变,调用方应静默退场。
+	ClaimRunning(ctx context.Context, id string) (bool, error)
 
 	// UpdateProgress 更新任务进度
 	UpdateProgress(ctx context.Context, id string, progress int, message string) error
