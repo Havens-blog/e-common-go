@@ -161,7 +161,18 @@ type TaskExecutor interface {
     Execute(ctx context.Context, task *Task) error
     GetType() TaskType
 }
+
+// TaskTimeoutProvider 可选接口：执行器声明自己的任务预算。
+// 未实现（或返回 <=0）时回落 DefaultTaskTimeout（30 分钟）。
+type TaskTimeoutProvider interface {
+    Timeout() time.Duration
+}
 ```
+
+超时语义是「队列不再等待」：执行器必须在长循环里检查 `ctx.Done()`
+（`if err := ctx.Err(); err != nil { break }`）才能真正提前退出。执行器
+完全忽略 ctx 时它仍会跑完，但不再占用 worker 容量。超时的任务直接落
+`failed`，不进重试——重试只会再撞同一个预算。
 
 ### 任务仓储接口
 
@@ -171,12 +182,17 @@ type TaskRepository interface {
     GetByID(ctx context.Context, id string) (Task, error)
     Update(ctx context.Context, task Task) error
     UpdateStatus(ctx context.Context, id string, status TaskStatus, message string) error
+    ClaimRunning(ctx context.Context, id string) (bool, error)
     UpdateProgress(ctx context.Context, id string, progress int, message string) error
     List(ctx context.Context, filter TaskFilter) ([]Task, error)
     Count(ctx context.Context, filter TaskFilter) (int64, error)
     Delete(ctx context.Context, id string) error
 }
 ```
+
+`ClaimRunning` 必须是**条件更新**（filter 同时匹配 `_id` 与 `status=pending`），
+不能退化成只按 `_id` 的盲写：盲写时两个副本都会认领成功，同一任务被并发
+执行两次。返回 `(false, nil)` 表示已被他人认领，调用方应静默退场。
 
 ## 高级用法
 

@@ -61,6 +61,26 @@ func (f *fakeRepo) UpdateStatus(_ context.Context, id string, status TaskStatus,
 	return nil
 }
 
+// ClaimRunning 模拟 Mongo 的条件更新语义:仅当任务仍为 pending 时推进到
+// running,否则返回 false。并发认领靠这里的锁串行化,等价于 DB 的
+// MatchedCount==1 判定。
+func (f *fakeRepo) ClaimRunning(_ context.Context, id string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	t, ok := f.tasks[id]
+	if !ok {
+		return false, fmt.Errorf("task not found: %s", id)
+	}
+	if t.Status != TaskStatusPending {
+		return false, nil
+	}
+
+	t.Status = TaskStatusRunning
+	f.tasks[id] = t
+	return true, nil
+}
+
 func (f *fakeRepo) UpdateProgress(_ context.Context, _ string, _ int, _ string) error { return nil }
 
 func (f *fakeRepo) List(_ context.Context, filter TaskFilter) ([]Task, error) {
@@ -191,6 +211,21 @@ type flakyRepo struct {
 	fmu         sync.Mutex
 	failTimes   int
 	statusCalls int
+}
+
+// ClaimRunning 注入认领失败:前 failTimes 次返回错误(模拟落库抖动),
+// 之后委托给 fakeRepo 做真正的条件更新。
+func (f *flakyRepo) ClaimRunning(ctx context.Context, id string) (bool, error) {
+	f.fmu.Lock()
+	f.statusCalls++
+	shouldFail := f.statusCalls <= f.failTimes
+	f.fmu.Unlock()
+
+	if shouldFail {
+		return false, fmt.Errorf("模拟 Mongo 抖动: connection socket was unexpectedly closed: EOF")
+	}
+
+	return f.fakeRepo.ClaimRunning(ctx, id)
 }
 
 func (f *flakyRepo) UpdateStatus(ctx context.Context, id string, status TaskStatus, msg string) error {
@@ -372,5 +407,177 @@ func TestSubmitDoesNotReadTaskAfterEnqueue(t *testing.T) {
 	// 落库的必须是提交那一刻的快照；若读到 worker 改写后的对象，状态就会漂移。
 	if got := repo.stored(); got.Status != TaskStatusPending {
 		t.Fatalf("落库状态被 worker 中途改写为 %q, want %q", got.Status, TaskStatusPending)
+	}
+}
+
+// 回归:认领必须是条件更新,不能是只按 _id 的盲写。
+// 历史缺陷:claimTask 走 UpdateStatus(只按 _id 更新),多副本时两边都返回
+// 成功,同一 task_id 被并发执行两次;进程内的 executing map 挡不住跨副本。
+func TestClaimRunningIsConditional(t *testing.T) {
+	repo := newFakeRepo(newTestTask("t1", TaskStatusPending))
+
+	first, err := repo.ClaimRunning(context.Background(), "t1")
+	if err != nil || !first {
+		t.Fatalf("首次认领应成功: claimed=%v err=%v", first, err)
+	}
+
+	second, err := repo.ClaimRunning(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("重复认领不应报错(应静默返回 false): %v", err)
+	}
+	if second {
+		t.Fatal("任务已被认领,第二次认领必须失败,否则同一任务会被两个副本并发执行")
+	}
+
+	got, _ := repo.GetByID(context.Background(), "t1")
+	if got.Status != TaskStatusRunning {
+		t.Fatalf("认领后状态=%s, want %s", got.Status, TaskStatusRunning)
+	}
+}
+
+// lostClaimRepo 让认领稳定返回 (false, nil):模拟任务已被另一副本抢走。
+type lostClaimRepo struct{ *fakeRepo }
+
+func (l *lostClaimRepo) ClaimRunning(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
+// 认领落败时必须静默退场:不执行、不改状态、不重试。
+func TestExecuteTaskSkipsWhenClaimLoses(t *testing.T) {
+	repo := &lostClaimRepo{fakeRepo: newFakeRepo(newTestTask("t1", TaskStatusPending))}
+	q := NewQueue(repo, elog.DefaultLogger, Config{WorkerNum: 1, BufferSize: 10})
+
+	exec := &countingExecutor{taskType: "test"}
+	q.RegisterExecutor(exec)
+
+	task := newTestTask("t1", TaskStatusPending)
+	q.executeTask(0, &task)
+
+	if got := exec.count(); got != 0 {
+		t.Fatalf("认领落败时不得执行,实测执行了 %d 次", got)
+	}
+	got, _ := repo.GetByID(context.Background(), "t1")
+	if got.Status != TaskStatusPending {
+		t.Fatalf("认领落败不得改写任务状态,实际=%s", got.Status)
+	}
+	if q.isExecuting("t1") {
+		t.Fatal("执行标记必须释放,否则恢复循环永远不敢再投这个任务")
+	}
+}
+
+// slowExecutor 阻塞到 ctx 取消或兜底超时,模拟卡在厂商 API 长尾上的执行器。
+type slowExecutor struct {
+	taskType TaskType
+	timeout  time.Duration
+	release  chan struct{}
+	started  chan struct{}
+	once     sync.Once
+}
+
+func (s *slowExecutor) Execute(ctx context.Context, _ *Task) error {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return nil
+	case <-time.After(5 * time.Second):
+		return nil
+	}
+}
+
+func (s *slowExecutor) GetType() TaskType { return s.taskType }
+
+func (s *slowExecutor) Timeout() time.Duration { return s.timeout }
+
+// 回归:执行器超预算时必须落 failed 且不进重试。
+// 历史缺陷:executeTask 用 context.Background() 执行,零 deadline;一个卡死的
+// 执行器永久吃掉 1/5 worker(默认 5 个),日志里只有「开始执行」没有「失败」。
+func TestExecuteTaskTimeoutMarksFailed(t *testing.T) {
+	const budget = 50 * time.Millisecond
+
+	repo := newFakeRepo(newTestTask("t1", TaskStatusPending))
+	q := NewQueue(repo, elog.DefaultLogger, Config{WorkerNum: 1, BufferSize: 10})
+
+	exec := &slowExecutor{
+		taskType: "test",
+		timeout:  budget,
+		release:  make(chan struct{}),
+		started:  make(chan struct{}),
+	}
+	q.RegisterExecutor(exec)
+
+	task := newTestTask("t1", TaskStatusPending)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		q.executeTask(0, &task)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("执行器超预算后 executeTask 必须返回,否则 worker 被永久占用")
+	}
+
+	got, _ := repo.GetByID(context.Background(), "t1")
+	if got.Status != TaskStatusFailed {
+		t.Fatalf("超时后状态=%s, want %s", got.Status, TaskStatusFailed)
+	}
+	if got.RetryCount != 0 {
+		t.Fatalf("超时不得进重试(重试只会再撞同一预算),RetryCount=%d", got.RetryCount)
+	}
+	if len(q.taskChan) != 0 {
+		t.Fatalf("超时任务不得重新入队,channel=%d", len(q.taskChan))
+	}
+	if q.isExecuting("t1") {
+		t.Fatal("超时后执行标记必须释放,否则恢复循环永远不敢再投这个任务")
+	}
+}
+
+// 任务预算:执行器声明优先,未声明或非法值回落默认。
+func TestTaskTimeoutOf(t *testing.T) {
+	if got := taskTimeoutOf(&noopExecutor{taskType: "test"}); got != DefaultTaskTimeout {
+		t.Fatalf("未声明预算应回落默认值, got=%s want=%s", got, DefaultTaskTimeout)
+	}
+
+	if got := taskTimeoutOf(&slowExecutor{taskType: "test", timeout: 2 * time.Minute}); got != 2*time.Minute {
+		t.Fatalf("应使用执行器声明的预算, got=%s want=2m", got)
+	}
+
+	if got := taskTimeoutOf(&slowExecutor{taskType: "test", timeout: -1}); got != DefaultTaskTimeout {
+		t.Fatalf("非法预算应回落默认值, got=%s want=%s", got, DefaultTaskTimeout)
+	}
+}
+
+// 并发认领:同一 pending 任务被 N 个副本同时抢,只能有一个认领成功。
+// 这是多副本部署的前提——盲写(UPDATE ... WHERE _id=?)会让 N 个都成功。
+func TestClaimRunningConcurrentOnlyOneWins(t *testing.T) {
+	const contenders = 16
+
+	repo := newFakeRepo(newTestTask("t1", TaskStatusPending))
+
+	var (
+		wins  atomic.Int32
+		start = make(chan struct{})
+		wg    sync.WaitGroup
+	)
+	for i := 0; i < contenders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // 尽量让 N 个 goroutine 同时冲进条件更新
+			if ok, err := repo.ClaimRunning(context.Background(), "t1"); err == nil && ok {
+				wins.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("并发认领成功次数=%d, want 1(多于 1 即同一任务被重复执行)", got)
 	}
 }

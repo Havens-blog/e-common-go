@@ -1,4 +1,4 @@
-﻿package taskx
+package taskx
 
 import (
 	"context"
@@ -104,6 +104,30 @@ func (r *MongoRepository) UpdateStatus(ctx context.Context, id string, status Ta
 	)
 
 	return err
+}
+
+// ClaimRunning 原子地把 pending 任务推进到 running,返回是否认领成功。
+//
+// 互斥量就是 filter 里的 status 条件:并发的两个副本只有一个能 MatchedCount=1,
+// 另一个匹配不到文档返回 0,不产生错误——由调用方按「认领失败」静默退场。
+// 不能用 UpdateStatus 代替:那是对 _id 的盲写,两个副本都会成功。
+func (r *MongoRepository) ClaimRunning(ctx context.Context, id string) (bool, error) {
+	collection := r.db.Collection(r.collectionName)
+
+	res, err := collection.UpdateOne(
+		ctx,
+		bson.M{"_id": id, "status": TaskStatusPending},
+		bson.M{"$set": bson.M{
+			"status":     TaskStatusRunning,
+			"message":    "任务开始执行",
+			"started_at": time.Now(),
+		}},
+	)
+	if err != nil {
+		return false, err
+	}
+
+	return res.MatchedCount == 1, nil
 }
 
 // UpdateProgress 更新任务进度
